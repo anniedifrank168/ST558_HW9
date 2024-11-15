@@ -1,0 +1,336 @@
+---
+title: "HW9_AJD"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE}
+
+#pacman to check whether packages are installed, if not load them
+if (!require("pacman")) install.packages("pacman")
+library(pacman)
+pacman::p_load(dplyr,
+ tidyverse,
+ ggplot2,
+ readr,
+ psych,
+ lubridate,
+ GGally,
+ tidymodels,
+ recipes)
+
+```
+
+## Homework 9 extension starts around line 334!
+
+### 1. Reading in the data
+
+```{r}
+read_csv("SeoulBikeData.csv",locale=locale(encoding="latin1")) ->bikedata
+```
+
+### 2. EDA
+
+```{r}
+#1. Checking for missingness
+sum(is.na(bikedata))
+  #no NAs 
+
+#2. Checking the column types and values
+head(bikedata)
+#all column types make sense, except the date-
+bikedata$Date <- mdy(bikedata$Date)
+
+summary(bikedata)
+#numeric columns are fine, categoricals need converted to factors
+bikedata <- bikedata %>%
+  mutate(across(where(is.character), as.factor))
+
+lapply(bikedata[sapply(bikedata, is.factor)], table)
+#categorical variables look fine
+
+#Renaming columns for ease
+names(bikedata) <-
+  c(
+    "date",
+    "rental_count",
+    "hour",
+    "temperature",
+    "humidity",
+    "wind_speed",
+    "visability",
+    "dew_pt_temp",
+    "solar_radiation",
+    "rainfall",
+    "snowfall",
+    "seasons",
+    "holiday",
+    "functioning_day"
+  )
+
+#additional summary statistics
+table(bikedata$functioning_day)
+table(bikedata$holiday)
+table(bikedata$seasons)
+
+summary(bikedata$rental_count)
+
+bikedata %>% group_by(functioning_day, holiday, seasons) %>% summarize(count =
+                                                                         n())
+
+bikedata %>% group_by(functioning_day, rental_count) %>% summarize()
+
+#filtering dataset on functioning days only
+bikedata <- bikedata %>% filter(functioning_day == "Yes")
+
+#summarize across the hours
+bikedata_summary <-
+  bikedata %>% group_by(date, seasons, holiday) %>%
+  summarize(
+    #summing rental count, rainfall, and snowfall
+    total_rental_count = sum(rental_count, na.rm = TRUE),
+    total_rainfall = sum(rainfall, na.rm = TRUE),
+    total_snowfall = sum(snowfall, na.rm = TRUE),
+    
+    #calculate mean for other weather-related variables (temperature, dew_pt_temp, humidity, wind_speed, visability, solar_radiation)
+    avg_temperature = mean(temperature, na.rm = TRUE),
+    avg_humidity = mean(humidity, na.rm = TRUE),
+    avg_wind_speed = mean(wind_speed, na.rm = TRUE),
+    avg_dew_pt_temp = mean(dew_pt_temp, na.rm = TRUE),
+    avg_visability = mean(visability, na.rm = TRUE),
+    avg_solar_radiation = mean(solar_radiation, na.rm = TRUE)
+  ) %>% ungroup()
+
+#Basic summary stats with new data 
+summary(bikedata_summary)
+sum(is.na(bikedata_summary))
+ #get rid of the na's 
+bikedata_summary<- bikedata_summary%>% drop_na()
+
+  #correlation matrix between the numeric variables 
+bike_numeric <- bikedata_summary[sapply(bikedata_summary, is.numeric)]
+cor(bike_numeric)
+
+```
+
+There are some obvious/expected correlations just due to this being a lot of weather data, such as a positive correlation between humidity and rainfall. Something I think is interesting is the positive correlation between dew pt. and total rental count (I hate a humid day) but again that's probably just because, as we see, dew pt. has almost a completely positive correlation with temperature (0.97)
+
+```{r}
+categorical_vars <- c("seasons","holiday")
+numeric_vars <- names(bike_numeric)
+
+#Loop through each categorical variable to create a plot
+for (cat_var in categorical_vars) {
+  long_data<- bikedata_summary %>%
+    select(all_of(c(cat_var,numeric_vars))) %>% 
+    pivot_longer(cols = all_of(numeric_vars), names_to = "numeric_variable", values_to = "value")
+
+  #plot
+  plot <- ggplot(long_data, aes_string(x = cat_var, y = "value")) +
+    geom_boxplot() +
+    facet_wrap(~ numeric_variable, scales = "free_y") +
+    labs(
+      title = paste("Relationship Between", cat_var, "and Numeric Variables"),
+      x = cat_var,
+      y = "Value"
+    ) +
+    theme_minimal()
+  
+  # Print the plot
+  print(plot)
+}
+
+```
+
+The relationship between snow and rainfall and whether it's a holiday or not is weird! Other than that, there isn't anything way out of the ordinary.
+
+```{r}
+#Looking at how total rent count relates to the other variables 
+  
+  #with numeric variables using GGally package 
+ggpairs(bike_numeric, title = "Scatterplot Matrix: Total Rental Count and Numeric Variables",
+        #first time I printed everything was way too big for screen 
+        lower = list(continuous = wrap("points", size = 0.5, alpha = 0.3)), #adjust point size for each scatter plot 
+        upper = list(continuous = wrap("cor", size = 3)) #adjust size of the corr. statistics in each box 
+) + theme(
+   axis.text = element_text(size = 6), #smaller axis labels 
+   strip.text = element_text(size = 6) #smaller facet labels 
+ )
+
+  #with categorical variables 
+for (cat_var in categorical_vars) {
+  #boxplot for each categorical variable
+  plot <- ggplot(bikedata_summary, aes_string(x = cat_var, y = "total_rental_count")) +
+    geom_boxplot() +
+    labs(
+      title = paste("Total Rental Count by", cat_var),
+      x = cat_var,
+      y = "Total Rental Count"
+    ) +
+    theme_minimal()
+  
+  #print the plot
+  print(plot)
+}
+
+```
+
+These both makes logistical sense.
+
+### 3. Splitting the data
+
+```{r}
+#split the data into training (75%) and testing (25%) sets, stratified by 'seasons'
+set.seed(123)  # Set a seed for reproducibility
+bike_split <- initial_split(bikedata_summary, prop = 0.75, strata = seasons)
+
+#extract the training and testing sets
+train_data <- training(bike_split)
+test_data <- testing(bike_split)
+
+#on the training data, create a 10-fold CV split 
+cv_split <- vfold_cv(train_data, v = 10, strata = seasons)
+
+#checking the structure of the cross-validation splits
+cv_split
+```
+
+### 4. Fitting three different models
+
+-   Here, we will also fit the models using 10-fold cross-validation to determine the best model.
+
+```{r error=FALSE, warning= FALSE}
+#Recipe #1 ---------------
+
+  #fixing the date column
+bike_1_recipe <- recipe(total_rental_count ~ ., data = bikedata_summary) %>%
+  #extract the day of the week from the date variable
+  step_date(date, features = "dow", label = TRUE) %>%
+  #create a new factor variable 'weekday_weekend'
+  step_mutate(
+    weekday_weekend = factor(if_else(date_dow %in% c("Sat", "Sun"), "Weekend", "Weekday"))
+  ) %>%
+  #remove the intermediate 'dow' variable and the original 'date' variable
+  step_rm(date_dow, date) %>% 
+  #standardize numeric vars 
+  step_normalize(all_numeric()) %>% 
+  #dummy variables 
+  step_dummy(all_nominal_predictors())
+
+#prepare and bake the recipe
+first_recipe<- prep(bike_1_recipe)
+bike_1_recipe
+bake(first_recipe, bikedata_summary)
+
+#Recipe #2 ---------------
+
+bike_2_recipe <- recipe(total_rental_count ~ ., data = bikedata_summary) %>%
+  step_date(date, features = "dow", label = TRUE) %>%
+  step_mutate(
+    weekday_weekend = factor(if_else(date_dow %in% c("Sat", "Sun"), "Weekend", "Weekday"))
+  ) %>%
+  step_rm(date_dow, date) %>% 
+  step_normalize(all_numeric()) %>% 
+  
+  ######add interaction terms 
+  step_interact(~starts_with("seasons"):holiday) %>% 
+  step_interact(~starts_with("seasons"):avg_temperature) %>% 
+  step_interact(~avg_temperature:total_rainfall) %>% 
+
+  #dummy variables 
+  step_dummy(all_nominal_predictors())
+
+prep(bike_2_recipe)
+
+#Recipe #3 ---------------
+
+bike_3_recipe <- recipe(total_rental_count ~ ., data = bikedata_summary) %>%
+  step_date(date, features = "dow", label = TRUE) %>%
+  step_mutate(
+    weekday_weekend = factor(if_else(date_dow %in% c("Sat", "Sun"), "Weekend", "Weekday"))
+  ) %>%
+  step_rm(date_dow, date) %>% 
+  step_normalize(all_numeric()) %>% 
+
+  step_interact(~starts_with("seasons"):holiday) %>% 
+  step_interact(~starts_with("seasons"):avg_temperature) %>% 
+  step_interact(~avg_temperature:total_rainfall) %>% 
+  
+  ######add quadratic terms for each numeric predictor 
+  step_poly(all_numeric_predictors(), degree = 2, options = list(raw = TRUE)) %>% 
+  
+  #dummy variables 
+  step_dummy(all_nominal_predictors())
+
+prep(bike_3_recipe)
+
+
+#Set up linear model fit to use the 'lm' engine 
+recipe_model<- linear_reg() %>% 
+  set_engine("lm")
+
+#create recipe workflows   
+recipe_1_wfl <- workflow() %>% 
+  add_recipe(bike_1_recipe) %>% 
+  add_model(recipe_model)
+recipe_1_wfl
+  
+recipe_2_wfl <- workflow() %>% 
+  add_recipe(bike_2_recipe) %>% 
+  add_model(recipe_model)
+recipe_2_wfl
+  
+recipe_3_wfl <- workflow() %>% 
+  add_recipe(bike_3_recipe) %>% 
+  add_model(recipe_model)
+recipe_3_wfl
+  
+
+#Fit the models using 10 fold CV via fit_resamples() 
+rec_10_fold <- vfold_cv(train_data, 10)
+  
+rec1_fits <- recipe_1_wfl %>% 
+  fit_resamples(rec_10_fold)
+  
+rec2_fits <- recipe_2_wfl %>% 
+  fit_resamples(rec_10_fold) 
+  
+rec3_fits <- recipe_3_wfl %>% 
+  fit_resamples(rec_10_fold)
+ 
+#collect metrics of the three models 
+rbind(
+  rec1_fits %>% collect_metrics(),
+  rec2_fits %>% collect_metrics(),
+  rec3_fits %>% collect_metrics())
+```
+
+Looking at the metrics of the three models, the best model is model 2 with the lowest rmse and highest value of R-squared.
+
+### 5. Fitting the best model.
+
+-   Here, we will fit the best model to the entire training data set
+
+    -   we will additionally compute the RMSE metric on the test set and obtain the model (fit on the entire training set) coefficient table
+
+```{r warning = FALSE}
+
+#fitting on the training set bbnfgb
+final_fit <- recipe_2_wfl %>% last_fit(split = bike_split)
+
+#finding test set metrics
+final_fit %>% collect_metrics()
+
+#obtaining the final model fit 
+final_model <- final_fit %>% extract_fit_parsnip()
+
+#tidy table of coefficients 
+tidy(final_model)
+
+```
+
+### Conclusions:
+
+The RMSE metric of the test set is 0.301. The R-squared value is 0.91, meaning the model explains 91% of the variance in the total_rental_count. The coefficient table shows each coefficient/estimate for the predictors in the model.
+
+## Homework 9 Extension
